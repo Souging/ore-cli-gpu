@@ -1,114 +1,135 @@
-#include <stdint.h>
-#include <stdio.h>
-#include "drillx.h"
-#include "equix.h"
-#include "hashx.h"
-#include "equix/src/context.h"
-#include "equix/src/solver.h"
-#include "equix/src/solver_heap.h"
-#include "hashx/src/context.h"
+/* Copyright (c) 2020 tevador <tevador@gmail.com> */
+/* See LICENSE for licensing information */
 
-const int BATCH_SIZE = 2048;
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <hashx.h>
+#include "blake2.h"
+#include "hashx_endian.h"
+#include "program.h"
+#include "context.h"
 
-extern "C" void hash(uint8_t *challenge, uint8_t *nonce, uint64_t *out) {
-    // Allocate pinned memory for ctxs and hash_space
-    hashx_ctx** ctxs;
-    uint64_t** hash_space;
+#if HASHX_SIZE > 32
+#error HASHX_SIZE cannot be more than 32
+#endif
 
-    cudaMallocHost(&ctxs, BATCH_SIZE * sizeof(hashx_ctx*));
-    cudaMallocHost(&hash_space, BATCH_SIZE * sizeof(uint64_t*));
+#ifndef HASHX_BLOCK_MODE
+#define HASHX_INPUT_ARGS input
+#else
+#define HASHX_INPUT_ARGS input, size
+#endif
 
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        cudaMalloc(&hash_space[i], INDEX_SPACE * sizeof(uint64_t));
+static int initialize_program(hashx_ctx* ctx, hashx_program* program, siphash_state keys[2]) {
+    if (!hashx_program_generate(&keys[0], program)) {
+        return 0;
     }
 
-    // Prepare seed and hash contexts
-    uint8_t seed[40];
-    memcpy(seed, challenge, 32);
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        uint64_t nonce_offset = *((uint64_t*)nonce) + i;
-        memcpy(seed + 32, &nonce_offset, 8);
-        ctxs[i] = hashx_alloc(HASHX_INTERPRETED);
-        if (!ctxs[i] || !hashx_make(ctxs[i], seed, 40)) {
-            cudaFreeHost(ctxs);
-            return;
-        }
-    }
+#ifndef HASHX_BLOCK_MODE
+    memcpy(&ctx->keys, &keys[1], 32);
+#else
+    memcpy(&ctx->params.salt, &keys[1], 32);
+#endif
 
-    // Launch kernel to parallelize hashx operations
-    dim3 threadsPerBlock(1024); // 256 threads per block
-    dim3 blocksPerGrid((65536 * BATCH_SIZE + threadsPerBlock.x - 1) / threadsPerBlock.x); // enough blocks to cover batch
-    do_hash_stage0i<<<blocksPerGrid, threadsPerBlock>>>(ctxs, hash_space);
-    
+#ifndef NDEBUG
+    ctx->has_program = true;
+#endif
 
-    // Copy hashes back to cpu
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        cudaMemcpy(out + i * INDEX_SPACE, hash_space[i], INDEX_SPACE * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    }
-
-    // Free memory
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        hashx_free(ctxs[i]);
-        cudaFree(hash_space[i]);
-    }
-    cudaFreeHost(hash_space);
-    cudaFreeHost(ctxs);
+    return 1;
 }
 
-__global__ void do_hash_stage0i(hashx_ctx** ctxs, uint64_t** hash_space) {
-    uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t batch_idx = item / INDEX_SPACE;
-    uint32_t i = item % INDEX_SPACE;
-    if (batch_idx < BATCH_SIZE) {
-        hash_stage0i(ctxs[batch_idx], hash_space[batch_idx], i);
+int hashx_make(hashx_ctx* ctx, const void* seed, size_t size) {
+    assert(ctx != NULL && ctx != HASHX_NOTSUPP);
+    assert(seed != NULL || size == 0);
+
+    siphash_state keys[2];
+    blake2b_state hash_state;
+    hashx_blake2b_init_param(&hash_state, &hashx_blake2_params);
+    hashx_blake2b_update(&hash_state, seed, size);
+    hashx_blake2b_final(&hash_state, &keys, sizeof(keys));
+
+    if (ctx->type & HASHX_COMPILED) {
+        hashx_program program;
+        if (!initialize_program(ctx, &program, keys)) {
+            return 0;
+        }
+        hashx_compile(&program, ctx->code);
+        return 1;
     }
+
+    return initialize_program(ctx, ctx->program, keys);
 }
 
-extern "C" void solve_all_stages(uint64_t *hashes, uint8_t *out, uint32_t *sols, int num_sets) {
-    // Allocate device memory
-    uint64_t *d_hashes;
-    solver_heap *d_heaps;
-    equix_solution *d_solutions;
-    uint32_t *d_num_sols;
+__device__ void hashx_exec(const hashx_ctx* ctx, HASHX_INPUT, void* output) {
+    assert(ctx != NULL && ctx != HASHX_NOTSUPP);
+    assert(output != NULL);
+    assert(ctx->has_program);
 
-    cudaMalloc(&d_hashes, num_sets * INDEX_SPACE * sizeof(uint64_t));
-    cudaMalloc(&d_heaps, num_sets * sizeof(solver_heap));
-    cudaMalloc(&d_solutions, num_sets * EQUIX_MAX_SOLS * sizeof(equix_solution));
-    cudaMalloc(&d_num_sols, num_sets * sizeof(uint32_t));
+    uint64_t r[8];
 
-    // Allocate pinned host memory
-    equix_solution *h_solutions;
-    uint32_t *h_num_sols;
-    cudaHostAlloc(&h_solutions, num_sets * EQUIX_MAX_SOLS * sizeof(equix_solution), cudaHostAllocDefault);
-    cudaHostAlloc(&h_num_sols, num_sets * sizeof(uint32_t), cudaHostAllocDefault);
+#ifndef HASHX_BLOCK_MODE
+    hashx_siphash24_ctr_state512(&ctx->keys, input, r);
+#else
+    hashx_blake2b_4r(&ctx->params, input, size, r);
+#endif
 
-    // Copy input data to device
-    cudaMemcpy(d_hashes, hashes, num_sets * INDEX_SPACE * sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-    // Launch kernel
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (num_sets + threadsPerBlock - 1) / threadsPerBlock;
-    solve_all_stages_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_hashes, d_heaps, d_solutions, d_num_sols);
-
-    // Copy results back to host using pinned memory
-    cudaMemcpy(h_solutions, d_solutions, num_sets * EQUIX_MAX_SOLS * sizeof(equix_solution), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_num_sols, d_num_sols, num_sets * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-    // Process results
-    for (int i = 0; i < num_sets; i++) {
-        sols[i] = h_num_sols[i];
-        if (h_num_sols[i] > 0) {
-            memcpy(out + i * sizeof(equix_solution), &h_solutions[i * EQUIX_MAX_SOLS], sizeof(equix_solution));
-        }
+    if (ctx->type & HASHX_COMPILED) {
+        ctx->func(r);
+    }
+    else {
+        hashx_program_execute(ctx->program, r);
     }
 
-    // Free device memory
-    cudaFree(d_hashes);
-    cudaFree(d_heaps);
-    cudaFree(d_solutions);
-    cudaFree(d_num_sols);
+    /* Hash finalization to remove bias toward 0 caused by multiplications */
+#ifndef HASHX_BLOCK_MODE
+    r[0] += ctx->keys.v0;
+    r[1] += ctx->keys.v1;
+    r[6] += ctx->keys.v2;
+    r[7] += ctx->keys.v3;
+#else
+    const uint8_t* p = (const uint8_t*)&ctx->params;
+    r[0] ^= load64(&p[8 * 0]);
+    r[1] ^= load64(&p[8 * 1]);
+    r[2] ^= load64(&p[8 * 2]);
+    r[3] ^= load64(&p[8 * 3]);
+    r[4] ^= load64(&p[8 * 4]);
+    r[5] ^= load64(&p[8 * 5]);
+    r[6] ^= load64(&p[8 * 6]);
+    r[7] ^= load64(&p[8 * 7]);
+#endif
 
-    // Free pinned host memory
-    cudaFreeHost(h_solutions);
-    cudaFreeHost(h_num_sols);
+    /* 1 SipRound per 4 registers is enough to pass SMHasher. */
+    SIPROUND(r[0], r[1], r[2], r[3]);
+    SIPROUND(r[4], r[5], r[6], r[7]);
+
+    /* optimized output for hash sizes that are multiples of 8 */
+    uint8_t* temp_out = (uint8_t*)output;
+#if HASHX_SIZE % 8 == 0
+#if HASHX_SIZE >= 8
+    store64(temp_out + 0, r[0] ^ r[4]);
+#endif
+#if HASHX_SIZE >= 16
+    store64(temp_out + 8, r[1] ^ r[5]);
+#endif
+#if HASHX_SIZE >= 24
+    store64(temp_out + 16, r[2] ^ r[6]);
+#endif
+#if HASHX_SIZE >= 32
+    store64(temp_out + 24, r[3] ^ r[7]);
+#endif
+#else /* any output size */
+#if HASHX_SIZE > 0
+    store64(temp_out + 0, r[0] ^ r[4]);
+#endif
+#if HASHX_SIZE > 8
+    store64(temp_out + 8, r[1] ^ r[5]);
+#endif
+#if HASHX_SIZE > 16
+    store64(temp_out + 16, r[2] ^ r[6]);
+#endif
+#if HASHX_SIZE > 24
+    store64(temp_out + 24, r[3] ^ r[7]);
+#endif
+    memcpy(output, temp_out, HASHX_SIZE);
+#endif
 }
